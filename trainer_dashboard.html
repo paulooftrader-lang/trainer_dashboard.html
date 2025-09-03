@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Painel do Personal Trainer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, onAuthStateChanged, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, query, onSnapshot, doc, updateDoc, addDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getAnalytics } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-analytics.js";
+
+        setLogLevel('debug'); // Ativar logs do Firestore
+
+        // Suas configurações do Firebase
+        const firebaseConfig = {
+          apiKey: "AIzaSyC0xGHVBK3vFiRVLnkDUNEIyOphmR5G2Sc",
+          authDomain: "agenda-trainer.firebaseapp.com",
+          projectId: "agenda-trainer",
+          storageBucket: "agenda-trainer.firebasestorage.app",
+          messagingSenderId: "460724251608",
+          appId: "1:460724251608:web:0fe270e1dedab36f1be0ad",
+          measurementId: "G-3Y1553R5SW"
+        };
+        
+        // Initialize Firebase
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const analytics = getAnalytics(app);
+        let userId = null;
+        const appId = firebaseConfig.projectId;
+
+        let progressChartInstance = null;
+        let selectedClient = null;
+        let clients = [];
+
+        // UI elements
+        const clientListDiv = document.getElementById('client-list');
+        const clientNameEl = document.getElementById('client-name');
+        const clientGoalsEl = document.getElementById('client-goals');
+        const dashboardContentDiv = document.getElementById('dashboard-content');
+        const workoutPlanUl = document.getElementById('workout-plan');
+        const progressForm = document.getElementById('progress-form');
+        const addClientBtn = document.getElementById('add-client-btn');
+        const addClientModal = document.getElementById('add-client-modal');
+        const addClientForm = document.getElementById('add-client-form');
+        const cancelAddClientBtn = document.getElementById('cancel-add-client-btn');
+        const loginModal = document.getElementById('login-modal');
+        const loginForm = document.getElementById('login-form');
+        const registerForm = document.getElementById('register-form');
+        const showRegisterBtn = document.getElementById('show-register-btn');
+        const showLoginBtn = document.getElementById('show-login-btn');
+        const authMessage = document.getElementById('auth-message');
+        const logoutBtn = document.getElementById('logout-btn');
+        const userIdDisplay = document.getElementById('user-id-display');
+        const mainUi = document.getElementById('main-ui');
+        const loadingSpinner = document.getElementById('loading-spinner');
+        
+        const chartColors = {
+            primary: '#a38560',
+            font: '#4a4a4a',
+            grid: '#f0e9e1'
+        };
+
+        // --- AUTHENTICATION & DATA HANDLING ---
+
+        // Listen for authentication state changes
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                userId = user.uid;
+                userIdDisplay.textContent = `ID do Usuário: ${userId}`;
+                mainUi.classList.remove('hidden');
+                loginModal.classList.add('hidden');
+                logoutBtn.classList.remove('hidden');
+                authMessage.textContent = 'Carregando seus clientes...';
+                await subscribeToClients();
+                loadingSpinner.classList.add('hidden');
+            } else {
+                userId = null;
+                mainUi.classList.add('hidden');
+                loginModal.classList.remove('hidden');
+                logoutBtn.classList.add('hidden');
+                authMessage.textContent = '';
+                userIdDisplay.textContent = 'ID do Usuário: N/A';
+                clients = []; // Limpa clientes locais
+                renderClientCards();
+            }
+        });
+
+        // Handle email/password registration
+        registerForm.addEventListener('submit', (event) => {
+            event.preventDefault();
+            const email = registerForm['email'].value;
+            const password = registerForm['password'].value;
+            authMessage.textContent = 'Registrando...';
+            createUserWithEmailAndPassword(auth, email, password)
+                .then(() => {
+                    authMessage.textContent = 'Registro bem-sucedido! Redirecionando...';
+                })
+                .catch((error) => {
+                    authMessage.textContent = `Erro no registro: ${error.message}`;
+                    console.error("Registration error:", error);
+                });
+        });
+
+        // Handle email/password login
+        loginForm.addEventListener('submit', (event) => {
+            event.preventDefault();
+            const email = loginForm['email'].value;
+            const password = loginForm['password'].value;
+            authMessage.textContent = 'Entrando...';
+            signInWithEmailAndPassword(auth, email, password)
+                .then(() => {
+                    authMessage.textContent = 'Login bem-sucedido!';
+                })
+                .catch((error) => {
+                    authMessage.textContent = `Erro no login: ${error.message}`;
+                    console.error("Login error:", error);
+                });
+        });
+
+        // Handle logout
+        logoutBtn.addEventListener('click', () => {
+            signOut(auth).catch((error) => {
+                console.error("Logout error:", error);
+            });
+        });
+
+        // Subscribe to client data in Firestore
+        async function subscribeToClients() {
+            if (!userId) return;
+            const q = query(collection(db, `artifacts/${appId}/users/${userId}/clients`));
+            onSnapshot(q, (querySnapshot) => {
+                clients = [];
+                querySnapshot.forEach((doc) => {
+                    const clientData = doc.data();
+                    const client = {
+                        ...clientData,
+                        id: doc.id,
+                        // Firestore cannot store arrays of objects directly without issues, so we stringify it.
+                        // We must parse it back here.
+                        progress: JSON.parse(clientData.progress) || []
+                    };
+                    clients.push(client);
+                });
+                renderClientCards();
+                // Select the first client if available
+                if (clients.length > 0 && !selectedClient) {
+                    selectClient(clients[0].id);
+                } else if (selectedClient) {
+                    // Update dashboard if the previously selected client is still in the list
+                    const updatedClient = clients.find(c => c.id === selectedClient.id);
+                    if (updatedClient) {
+                        selectClient(updatedClient.id);
+                    }
+                }
+                loadingSpinner.classList.add('hidden');
+                authMessage.textContent = '';
+            }, (error) => {
+                console.error("Firestore subscription error:", error);
+                authMessage.textContent = 'Erro ao carregar dados.';
+            });
+        }
+        
+        // --- UI FUNCTIONS ---
+
+        function renderClientCards() {
+            clientListDiv.innerHTML = '';
+            clients.forEach(client => {
+                const card = document.createElement('div');
+                card.id = `card-${client.id}`;
+                card.className = 'client-card p-4 rounded-xl';
+                card.innerHTML = `
+                    <h3 class="font-bold text-lg text-[#5a4a3b]">${client.name}</h3>
+                    <p class="text-sm text-gray-500 mb-2">${client.goals}</p>
+                    <div class="text-xs text-gray-400">Último check-in: ${client.lastCheckIn}</div>
+                `;
+                card.addEventListener('click', () => {
+                    selectClient(client.id);
+                });
+                clientListDiv.appendChild(card);
+            });
+        }
+
+        function selectClient(clientId) {
+            const client = clients.find(c => c.id === clientId);
+            if (!client) return;
+            
+            selectedClient = client;
+
+            clientNameEl.textContent = client.name;
+            clientGoalsEl.textContent = client.goals;
+            dashboardContentDiv.classList.remove('hidden');
+
+            const allCards = document.querySelectorAll('.client-card');
+            allCards.forEach(card => card.classList.remove('bg-gray-100'));
+            document.getElementById(`card-${clientId}`).classList.add('bg-gray-100');
+            
+            updateDashboard(client);
+        }
+
+        function updateDashboard(client) {
+            updateWorkoutPlan(client.workoutPlan);
+            updateProgressChart(client.progress, client.metric);
+        }
+
+        function updateWorkoutPlan(plan) {
+            workoutPlanUl.innerHTML = '';
+            if (plan) {
+                plan.forEach(item => {
+                    const li = document.createElement('li');
+                    li.textContent = item;
+                    workoutPlanUl.appendChild(li);
+                });
+            }
+        }
+
+        function updateProgressChart(progressData, metric) {
+            const dates = progressData.map(p => p.date);
+            const values = progressData.map(p => p.value);
+
+            if (progressChartInstance) {
+                progressChartInstance.destroy();
+            }
+
+            const ctx = document.getElementById('progressChart').getContext('2d');
+            progressChartInstance = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: dates,
+                    datasets: [{
+                        label: metric,
+                        data: values,
+                        borderColor: chartColors.primary,
+                        backgroundColor: 'rgba(163, 133, 96, 0.2)',
+                        borderWidth: 2,
+                        pointRadius: 5,
+                        tension: 0.4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: {
+                            grid: { color: chartColors.grid },
+                            ticks: { color: chartColors.font }
+                        },
+                        y: {
+                            beginAtZero: false,
+                            grid: { color: chartColors.grid },
+                            ticks: { color: chartColors.font }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            display: false,
+                        },
+                        tooltip: {
+                            backgroundColor: chartColors.primary,
+                        }
+                    }
+                }
+            });
+        }
+        
+        // --- FORM HANDLERS ---
+        
+        progressForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            if (!selectedClient) return;
+
+            const dateInput = document.getElementById('new-date');
+            const valueInput = document.getElementById('new-value');
+            
+            const newDate = dateInput.value;
+            const newValue = parseFloat(valueInput.value);
+
+            if (newDate && !isNaN(newValue)) {
+                // Update local client data and Firestore
+                const newProgress = [...selectedClient.progress, { date: newDate, value: newValue }];
+                updateProgressChart(newProgress, selectedClient.metric);
+
+                const clientDocRef = doc(db, `artifacts/${appId}/users/${userId}/clients`, selectedClient.id);
+                await updateDoc(clientDocRef, {
+                    progress: JSON.stringify(newProgress)
+                }).catch(e => console.error("Error updating progress:", e));
+                
+                dateInput.value = '';
+                valueInput.value = '';
+            }
+        });
+
+        addClientBtn.addEventListener('click', () => {
+            addClientModal.classList.remove('hidden');
+        });
+
+        cancelAddClientBtn.addEventListener('click', () => {
+            addClientModal.classList.add('hidden');
+        });
+        
+        addClientForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            if (!userId) {
+                console.error("User not authenticated.");
+                return;
+            }
+
+            const clientName = document.getElementById('client-name-input').value;
+            const clientGoals = document.getElementById('client-goals-input').value;
+            const clientMetric = document.getElementById('client-metric-input').value;
+
+            const newClient = {
+                name: clientName,
+                goals: clientGoals,
+                lastCheckIn: new Date().toLocaleDateString('pt-BR'),
+                workoutPlan: ['Plano de treino padrão.'],
+                progress: JSON.stringify([]), // Store as string
+                metric: clientMetric
+            };
+            
+            const clientCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/clients`);
+            await addDoc(clientCollectionRef, newClient).catch(e => console.error("Error adding client:", e));
+            
+            addClientForm.reset();
+            addClientModal.classList.add('hidden');
+        });
+
+        // Toggle between login and register forms
+        showRegisterBtn.addEventListener('click', () => {
+            loginForm.classList.add('hidden');
+            registerForm.classList.remove('hidden');
+            authMessage.textContent = '';
+        });
+
+        showLoginBtn.addEventListener('click', () => {
+            registerForm.classList.add('hidden');
+            loginForm.classList.remove('hidden');
+            authMessage.textContent = '';
+        });
+    </script>
+</head>
+<body class="p-6 md:p-10 flex flex-col items-center">
+    <div id="loading-spinner" class="mt-20">
+        <div class="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-[#a38560]"></div>
+    </div>
+
+    <!-- Login/Register Modal -->
+    <div id="login-modal" class="modal-overlay hidden">
+        <div class="modal-content text-center">
+            <h3 class="text-2xl font-bold text-[#5a4a3b] mb-4">Bem-vindo ao Painel do Personal Trainer</h3>
+            <p id="auth-message" class="text-sm text-red-500 mb-4"></p>
+            
+            <!-- Login Form -->
+            <form id="login-form" class="space-y-4">
+                <div>
+                    <input type="email" name="email" placeholder="Email" class="w-full rounded-md border-gray-300 p-2" required>
+                </div>
+                <div>
+                    <input type="password" name="password" placeholder="Senha" class="w-full rounded-md border-gray-300 p-2" required>
+                </div>
+                <button type="submit" class="w-full btn-primary text-white font-bold py-2 px-4 rounded-md">Entrar</button>
+                <div class="text-sm text-gray-500 mt-4">
+                    Não tem uma conta? <a href="#" id="show-register-btn" class="underline text-[#a38560]">Registre-se aqui</a>.
+                </div>
+            </form>
+
+            <!-- Register Form -->
+            <form id="register-form" class="space-y-4 hidden">
+                <div>
+                    <input type="email" name="email" placeholder="Email" class="w-full rounded-md border-gray-300 p-2" required>
+                </div>
+                <div>
+                    <input type="password" name="password" placeholder="Crie uma senha" class="w-full rounded-md border-gray-300 p-2" required>
+                </div>
+                <button type="submit" class="w-full btn-primary text-white font-bold py-2 px-4 rounded-md">Registrar</button>
+                <div class="text-sm text-gray-500 mt-4">
+                    Já tem uma conta? <a href="#" id="show-login-btn" class="underline text-[#a38560]">Entrar</a>.
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div id="main-ui" class="flex flex-col lg:flex-row gap-6 lg:gap-10 h-screen w-full hidden">
+        <!-- Client List - Left Pane -->
+        <div class="w-full lg:w-1/4 h-full flex flex-col gap-4 overflow-y-auto pr-2">
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-xl font-bold text-[#5a4a3b]">Meus Clientes</h2>
+                <button id="logout-btn" class="text-xs text-red-500 hidden hover:underline">Sair</button>
+            </div>
+            <p id="user-id-display" class="text-sm text-gray-500 truncate mb-2"></p>
+            <button id="add-client-btn" class="bg-[#e4dacf] text-[#5a4a3b] font-bold py-2 px-4 rounded-xl flex items-center justify-center space-x-2 hover:bg-[#c8b7a6] transition-colors">
+                <span>➕</span>
+                <span>Adicionar Cliente</span>
+            </button>
+            <div id="client-list" class="space-y-4">
+            </div>
+        </div>
+
+        <!-- Dashboard Content - Right Pane -->
+        <div class="w-full lg:w-3/4 flex flex-col gap-8 h-full overflow-y-auto">
+            <header class="text-center md:text-left">
+                <h1 id="client-name" class="text-3xl md:text-4xl font-extrabold text-[#5a4a3b] mb-2">Selecione um Cliente</h1>
+                <p id="client-goals" class="text-base md:text-lg text-gray-500">Clique em um cartão de cliente para ver os detalhes e progresso.</p>
+            </header>
+
+            <!-- Main dashboard sections (initially hidden or empty) -->
+            <div id="dashboard-content" class="space-y-8 hidden">
+                <!-- Section 1: Progress Tracking -->
+                <section class="section-card">
+                    <h3 class="text-xl font-bold text-[#5a4a3b] mb-4">Acompanhamento de Progresso</h3>
+                    <p class="text-sm text-gray-600 mb-6">Este gráfico mostra a evolução de métricas de treino importantes ao longo do tempo. Analise as tendências para ajustar o plano de treino.</p>
+                    <div class="chart-container">
+                        <canvas id="progressChart"></canvas>
+                    </div>
+                </section>
+
+                <!-- Section 2: Workout Plan -->
+                <section class="section-card">
+                    <h3 class="text-xl font-bold text-[#5a4a3b] mb-4">Plano de Treino</h3>
+                    <p class="text-sm text-gray-600 mb-4">O plano de treino atual é focado nos objetivos do cliente. Mantenha o foco e a consistência!</p>
+                    <ul id="workout-plan" class="list-disc list-inside space-y-2 text-sm text-gray-700 ml-4">
+                    </ul>
+                </section>
+
+                <!-- Section 3: Log New Data -->
+                <section class="section-card">
+                    <h3 class="text-xl font-bold text-[#5a4a3b] mb-4">Registrar Novo Progresso</h3>
+                    <p class="text-sm text-gray-600 mb-4">Adicione um novo ponto de dados de progresso para manter o histórico do seu cliente atualizado.</p>
+                    <form id="progress-form" class="space-y-4">
+                        <div>
+                            <label for="new-date" class="block text-sm font-medium text-gray-700">Data</label>
+                            <input type="date" id="new-date" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-[#a38560] focus:ring-1 focus:ring-[#a38560] p-2" required>
+                        </div>
+                        <div>
+                            <label for="new-value" class="block text-sm font-medium text-gray-700">Valor (kg)</label>
+                            <input type="number" step="0.1" id="new-value" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-[#a38560] focus:ring-1 focus:ring-[#a38560] p-2" required>
+                        </div>
+                        <button type="submit" class="w-full btn-primary text-white font-bold py-2 px-4 rounded-md">Adicionar Dados</button>
+                    </form>
+                </section>
+
+                <!-- Section 4: Weekly Schedule -->
+                <section class="section-card">
+                    <h3 class="text-xl font-bold text-[#5a4a3b] mb-4">Agenda Semanal</h3>
+                    <ul id="weekly-schedule" class="list-disc list-inside space-y-2 text-sm text-gray-700 ml-4">
+                        <li>Segunda-feira: Treino de Força Superior</li>
+                        <li>Terça-feira: Cardio e HIIT</li>
+                        <li>Quarta-feira: Treino de Força Inferior</li>
+                        <li>Quinta-feira: Dia de descanso ou Atividade leve</li>
+                        <li>Sexta-feira: Treino de Força Corporal Total</li>
+                        <li>Sábado: Treino de mobilidade e alongamento</li>
+                        <li>Domingo: Dia de descanso</li>
+                    </ul>
+                </section>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Client Modal -->
+    <div id="add-client-modal" class="modal-overlay hidden">
+        <div class="modal-content">
+            <h3 class="text-xl font-bold text-[#5a4a3b] mb-4">Novo Cliente</h3>
+            <form id="add-client-form" class="space-y-4">
+                <div>
+                    <label for="client-name-input" class="block text-sm font-medium text-gray-700">Nome</label>
+                    <input type="text" id="client-name-input" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" required>
+                </div>
+                <div>
+                    <label for="client-goals-input" class="block text-sm font-medium text-gray-700">Objetivos</label>
+                    <input type="text" id="client-goals-input" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" required>
+                </div>
+                <div>
+                    <label for="client-metric-input" class="block text-sm font-medium text-gray-700">Métrica de Acompanhamento (ex: Peso, Corrida)</label>
+                    <input type="text" id="client-metric-input" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" required>
+                </div>
+                <div class="flex justify-end space-x-4 mt-6">
+                    <button type="button" id="cancel-add-client-btn" class="px-4 py-2 text-gray-700 rounded-md hover:bg-gray-200">Cancelar</button>
+                    <button type="submit" class="btn-primary text-white font-bold py-2 px-4 rounded-md">Salvar</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
